@@ -1,0 +1,6 @@
+{
+  "name": "WiredByApun Content OS",
+  "description": "An AI-powered blogging operating system for Blogger websites, including a content pipeline, SEO modules, image systems, CRM pipeline, and Apps Script integration dashboards.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
