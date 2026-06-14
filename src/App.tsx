@@ -95,6 +95,13 @@ export default function App() {
   // Notification state
   const [toast, setToast] = useState<{ message: string; type: "success" | "error" | "info" } | null>(null);
 
+  // AI Config variables from backend (exclusive OpenRouter support)
+  const [openRouterModel, setOpenRouterModel] = useState<string>("meta-llama/llama-3.3-70b-instruct");
+  const [openRouterConfigured, setOpenRouterConfigured] = useState<boolean>(false);
+  const [apiKeyMasked, setApiKeyMasked] = useState<string>("");
+  const [inputApiKey, setInputApiKey] = useState<string>("");
+  const [showSettingsModal, setShowSettingsModal] = useState<boolean>(false);
+
   // Selected Working Post computed helper
   const selectedPost = useMemo(() => {
     return posts.find((p) => p.id === selectedPostId) || null;
@@ -161,8 +168,52 @@ export default function App() {
     }
   };
 
+  // Fetch AI configured status
+  const fetchAiConfig = async () => {
+    try {
+      const res = await fetch("/api/ai-config");
+      if (res.ok) {
+        const config = await res.json();
+        setOpenRouterModel(config.model);
+        setOpenRouterConfigured(config.openrouterConfigured);
+        setApiKeyMasked(config.apiKeyMasked || "");
+      }
+    } catch (e) {
+      console.error("Failed to load AI Config", e);
+    }
+  };
+
+  // Update backend config variables
+  const handleSaveAiConfig = async (model: string, apiKey?: string) => {
+    try {
+      const payload: { model: string; apiKey?: string } = { model };
+      if (apiKey !== undefined) {
+        payload.apiKey = apiKey;
+      }
+      
+      const res = await fetch("/api/ai-config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setOpenRouterModel(data.model);
+        setOpenRouterConfigured(data.openrouterConfigured);
+        setApiKeyMasked(data.apiKeyMasked || "");
+        if (apiKey) {
+          setInputApiKey(""); // reset temp key inputs after save
+        }
+        showToast(`AI Config updated: OpenRouter (${data.model})`, "success");
+      }
+    } catch (err) {
+      showToast("Failed to save AI configuration on backend", "error");
+    }
+  };
+
   useEffect(() => {
     fetchPosts();
+    fetchAiConfig();
     // Load GAS code immediately
     fetch("/api/export-gas")
       .then((res) => res.text())
@@ -311,11 +362,11 @@ export default function App() {
     }
   };
 
-  // Trigger server-side Gemini generation block
+  // Trigger server-side AI generation block
   const handleTriggerAIGeneration = async () => {
     if (!selectedPost) return;
     setIsGenerating(true);
-    setGenerationOutput("Initiating secure proxy connection to Gemini Flash AI...");
+    setGenerationOutput(`Initiating secure proxy connection to OpenRouter AI (${openRouterModel})...`);
     
     try {
       const res = await fetch("/api/generate", {
@@ -331,7 +382,7 @@ export default function App() {
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
         if (errData.needsApiKey) {
-          throw new Error("Gemini API Key missing. Please click Settings or configure GEMINI_API_KEY inside AI Studio UI secrets panel.");
+          throw new Error("OpenRouter API Key is missing. Click the 'AI Settings' button in the header to configure your custom key & model name.");
         }
         throw new Error(errData.error || "Generation endpoint faulted.");
       }
@@ -380,7 +431,7 @@ export default function App() {
         setPosts((prev) =>
           prev.map((p) => (p.id === selectedPostId ? freshPost : p))
         );
-        showToast("Gemini Content generated & saved into CRM records!", "success");
+        showToast("OpenRouter Content generated & saved into CRM records!", "success");
       }
 
       setGenerationOutput(null);
@@ -401,7 +452,10 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ topic: selectedPost.topic })
       });
-      if (!res.ok) throw new Error("Could not suggest custom asset descriptions.");
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.error || "Could not suggest custom asset descriptions.");
+      }
       const r = await res.json();
       setEditFeaturedPrompt(r.prompt);
       showToast("Suggested visual prompts imported!", "info");
@@ -548,10 +602,10 @@ export default function App() {
             <span className="text-teal-400 font-bold">{totalPublished} / {posts.length}</span>
           </div>
           <div className="flex items-center gap-2 pr-5">
-            <span className="text-slate-500">Workspace Status:</span>
+            <span className="text-slate-500">AI Engine Status:</span>
             <div className="flex items-center gap-1.5 font-semibold text-emerald-400">
-              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
-              Google API Proxy Active
+              <span className={`w-2 h-2 rounded-full animate-pulse ${openRouterConfigured ? "bg-emerald-400 animate-pulse" : "bg-amber-400 font-bold"}`}></span>
+              {openRouterConfigured ? `OpenRouter Active (${openRouterModel})` : `OpenRouter Key Missing`}
             </div>
           </div>
         </div>
@@ -559,16 +613,10 @@ export default function App() {
         {/* Action Controls */}
         <div className="flex items-center gap-3">
           <button
-            onClick={() => {
-              const p = prompt("Enter a blogging core topic or search query focus:");
-              if (p) {
-                setNewTopic(p);
-                alert("Topic initialized! Fill focus keys or click generate below.");
-              }
-            }}
-            className="flex items-center gap-1 text-xs text-slate-400 bg-slate-900 hover:text-white hover:bg-slate-800 border border-slate-800 px-3 py-1.5 rounded transition"
+            onClick={() => setShowSettingsModal(true)}
+            className="flex items-center gap-1 text-xs text-slate-400 bg-slate-900 hover:text-white hover:bg-slate-800 border border-slate-800 px-3 py-1.5 rounded transition cursor-pointer"
           >
-            <Settings className="w-3.5 h-3.5" /> Config
+            <Settings className="w-3.5 h-3.5 text-emerald-400" /> AI Settings
           </button>
           
           <span className="text-xs text-slate-400 bg-slate-900 px-3 py-1.5 rounded border border-slate-800">
@@ -1971,6 +2019,106 @@ export default function App() {
           <span className="text-emerald-400">Environment Ready</span>
         </span>
       </footer>
+
+      {showSettingsModal && (
+        <div className="fixed inset-0 bg-slate-950/90 backdrop-blur-md z-50 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-xl max-w-lg w-full p-6 space-y-6 shadow-2xl animate-in fade-in zoom-in-95 duration-150 text-slate-100">
+            <div className="flex items-center justify-between border-b border-slate-850 pb-3">
+              <div className="flex items-center gap-2.5">
+                <Settings className="w-5 h-5 text-purple-400" />
+                <h3 className="font-extrabold text-white text-sm uppercase tracking-wider">OpenRouter API Configuration</h3>
+              </div>
+              <button 
+                onClick={() => setShowSettingsModal(false)}
+                className="text-slate-400 hover:text-white text-xs bg-slate-950/80 hover:bg-slate-950 border border-slate-800 px-3 py-1 rounded transition cursor-pointer"
+              >
+                ✕ Close
+              </button>
+            </div>
+
+            <div className="space-y-4">
+              {/* API Key management */}
+              <div>
+                <label className="block text-[10px] uppercase font-bold text-slate-400 mb-1.5 tracking-wider">
+                  OpenRouter API Key
+                </label>
+                <div className="relative">
+                  <input
+                    type="password"
+                    value={inputApiKey}
+                    onChange={(e) => setInputApiKey(e.target.value)}
+                    placeholder={apiKeyMasked ? `Currently configured (${apiKeyMasked})` : "Enter your sk-or-v1-xxxxxx Key"}
+                    className="bg-slate-950 border border-slate-800 text-[11px] text-white rounded p-2.5 w-full focus:outline-none focus:border-purple-500 font-mono placeholder:text-slate-500"
+                  />
+                  {openRouterConfigured && (
+                    <div className="absolute top-1/2 right-3 -translate-y-1/2 bg-emerald-500/10 text-emerald-400 text-[9px] uppercase font-bold tracking-wider px-2 py-0.5 rounded border border-emerald-500/20">
+                      Key Configured
+                    </div>
+                  )}
+                </div>
+                <p className="text-[10px] text-slate-500 mt-1">
+                  Enter your custom OpenRouter API Key. Leave it blank if you want to keep the current key.
+                </p>
+              </div>
+
+              {/* Model selection */}
+              <div className="space-y-3 bg-slate-950 p-4 rounded-lg border border-slate-800">
+                <div>
+                  <label className="block text-[10px] uppercase font-bold text-slate-400 mb-1.5 tracking-wider">
+                    Select Presets Model
+                  </label>
+                  <select
+                    value={openRouterModel}
+                    onChange={(e) => {
+                      setOpenRouterModel(e.target.value);
+                    }}
+                    className="bg-slate-900 border border-slate-800 text-xs text-white rounded-lg p-2 w-full focus:outline-none focus:border-purple-500 font-sans cursor-pointer"
+                  >
+                    <option value="meta-llama/llama-3.3-70b-instruct">Llama 3.3 70B Instruct (meta-llama/llama-3.3-70b-instruct)</option>
+                    <option value="deepseek/deepseek-r1">DeepSeek R1 Distill (deepseek/deepseek-r1)</option>
+                    <option value="google/gemini-2.5-flash">Gemini 2.5 Flash (google/gemini-2.5-flash)</option>
+                    <option value="google/gemini-2.5-pro">Gemini 2.5 Pro (google/gemini-2.5-pro)</option>
+                    <option value="openai/gpt-4o-mini">GPT-4o Mini (openai/gpt-4o-mini)</option>
+                    <option value="anthropic/claude-3.5-sonnet">Claude 3.5 Sonnet (anthropic/claude-3.5-sonnet)</option>
+                  </select>
+                </div>
+                
+                <div>
+                  <span className="text-[10px] text-slate-500 block mb-1 font-bold uppercase tracking-wider">Or Input Custom Model ID:</span>
+                  <input
+                    type="text"
+                    value={openRouterModel}
+                    onChange={(e) => setOpenRouterModel(e.target.value)}
+                    placeholder="e.g. liquid/lfm-40b"
+                    className="bg-slate-900 border border-slate-800 text-[11px] text-white rounded p-2.5 w-full focus:outline-none focus:border-purple-500 font-mono placeholder:text-slate-600"
+                  />
+                  <span className="text-[9px] text-slate-500 mt-0.5 block">
+                    Type any valid OpenRouter model identifier string to activate it.
+                  </span>
+                </div>
+              </div>
+
+              {/* Save State button action */}
+              <div className="pt-2">
+                <button
+                  onClick={() => handleSaveAiConfig(openRouterModel, inputApiKey || undefined)}
+                  className="w-full py-2 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white font-extrabold text-xs rounded-lg transition uppercase tracking-wider cursor-pointer shadow-lg shadow-indigo-500/10"
+                >
+                  Save & Apply Changes
+                </button>
+              </div>
+            </div>
+
+            <div className="p-3 bg-slate-950 rounded-lg text-[10px] text-slate-400 leading-relaxed space-y-1 border border-slate-850">
+              <p className="font-extrabold text-slate-300">How OpenRouter integration operates:</p>
+              <ul className="list-disc pl-4 space-y-1">
+                <li>Provide model names exactly as listed in <a href="https://openrouter.ai/models" target="_blank" rel="noreferrer" className="text-purple-400 underline hover:text-purple-300">openrouter.ai/models</a>.</li>
+                <li>No Gemini SDK remains on this Content OS. All requests run through OpenRouter.</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+      )}
 
     </div>
   );

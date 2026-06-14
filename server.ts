@@ -2,7 +2,6 @@ import express from "express";
 import path from "path";
 import fs from "fs";
 import { createServer as createViteServer } from "vite";
-import { GoogleGenAI, Type } from "@google/genai";
 
 const app = express();
 const PORT = 3000;
@@ -12,25 +11,71 @@ const DB_FILE = path.join(process.cwd(), "posts_db.json");
 app.use(express.json({ limit: "15mb" }));
 app.use(express.urlencoded({ limit: "15mb", extended: true }));
 
-// Helper to lazy-initialize Gemini Client
-let aiClient: GoogleGenAI | null = null;
-function getGeminiClient(): GoogleGenAI {
-  if (!aiClient) {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey || apiKey === "MY_GEMINI_API_KEY") {
-      throw new Error("GEMINI_API_KEY environment variable is not configured in Secrets.");
+// AI System Configurations (Exclusive OpenRouter API Support)
+const CONFIG_FILE = path.join(process.cwd(), "ai_config.json");
+
+function readAiConfig() {
+  try {
+    if (!fs.existsSync(CONFIG_FILE)) {
+      const defaultConfig = {
+        model: process.env.OPENROUTER_MODEL || "meta-llama/llama-3.3-70b-instruct",
+        apiKey: process.env.OPENROUTER_API_KEY || ""
+      };
+      fs.writeFileSync(CONFIG_FILE, JSON.stringify(defaultConfig, null, 2));
+      return defaultConfig;
     }
-    aiClient = new GoogleGenAI({
-      apiKey: apiKey,
-      httpOptions: {
-        headers: {
-          "User-Agent": "aistudio-build",
-        },
-      },
-    });
+    const data = fs.readFileSync(CONFIG_FILE, "utf-8");
+    return JSON.parse(data);
+  } catch (error) {
+    console.error("Error reading AI Config file:", error);
+    return {
+      model: "meta-llama/llama-3.3-70b-instruct",
+      apiKey: ""
+    };
   }
-  return aiClient;
 }
+
+function writeAiConfig(config: { model: string; apiKey?: string }) {
+  try {
+    const existing = readAiConfig();
+    const newConfig = {
+      model: config.model,
+      apiKey: config.apiKey !== undefined ? config.apiKey : existing.apiKey
+    };
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify(newConfig, null, 2));
+  } catch (error) {
+    console.error("Error writing AI Config file:", error);
+  }
+}
+
+function cleanErrorMessage(errMsg: string): string {
+  const jsonStartIndex = errMsg.indexOf("{");
+  if (jsonStartIndex !== -1) {
+    const maybeJson = errMsg.substring(jsonStartIndex);
+    try {
+      const parsed = JSON.parse(maybeJson);
+      if (parsed?.error?.message) {
+        return parsed.error.message;
+      }
+    } catch (_) {
+      // Not parseable, proceed with fallback
+    }
+  }
+  return errMsg;
+}
+
+function extractJson(text: string): string {
+  let clean = text.trim();
+  const start = clean.indexOf("{");
+  const end = clean.lastIndexOf("}");
+  if (start !== -1 && end !== -1 && end > start) {
+    return clean.substring(start, end + 1);
+  }
+  return clean;
+}
+
+let initialConfig = readAiConfig();
+let activeOpenRouterModel = initialConfig.model;
 
 // Initial seeding data if database does not exist
 const initialSeedData = [
@@ -198,8 +243,105 @@ function writeDb(data: any) {
   }
 }
 
+// Format and handle LLM/AI configuration errors gracefully
+function handleAIError(error: any, res: any) {
+  let errMsg = error.message || String(error);
+  console.error("AI content generation error detail:", error);
+  
+  // Clean stringified JSON block inside error if present
+  errMsg = cleanErrorMessage(errMsg);
+
+  // Detect invalid or missing API keys (for OpenRouter)
+  const isInvalidKey = errMsg.toLowerCase().includes("api key not valid") || 
+                        errMsg.toLowerCase().includes("invalid_argument") || 
+                        errMsg.toLowerCase().includes("api_key_invalid") ||
+                        errMsg.toLowerCase().includes("api key") ||
+                        errMsg.toLowerCase().includes("unauthorized") ||
+                        errMsg.toLowerCase().includes("invalid key") ||
+                        errMsg.toLowerCase().includes("error: invalid keys") ||
+                        errMsg.toLowerCase().includes("missing api key");
+                        
+  const config = readAiConfig();
+  const apiKey = config.apiKey || process.env.OPENROUTER_API_KEY || "";
+
+  if (isInvalidKey || !apiKey || apiKey === "MY_OPENROUTER_API_KEY" || apiKey === "") {
+    return res.status(401).json({
+      error: "Your OpenRouter API Key is invalid, expired, or missing. To fix this: click the 'AI Settings' button in the header and configure your custom API Key and Model Name directly.",
+      needsApiKey: true,
+      provider: "openrouter"
+    });
+  }
+
+  // Normal fallback error
+  return res.status(500).json({
+    error: errMsg,
+    needsApiKey: false
+  });
+}
+
 // Ensure DB file exists on startup
 readDb();
+
+// AI Provider Configuration Endpoints
+app.get("/api/ai-config", (req, res) => {
+  const currentConfig = readAiConfig();
+  activeOpenRouterModel = currentConfig.model;
+
+  const rawKey = currentConfig.apiKey || process.env.OPENROUTER_API_KEY || "";
+  const openrouterApiKeyConfigured = !!(rawKey && rawKey !== "MY_OPENROUTER_API_KEY" && rawKey !== "");
+  
+  let apiKeyMasked = "";
+  if (openrouterApiKeyConfigured) {
+    const len = rawKey.length;
+    if (len > 8) {
+      apiKeyMasked = rawKey.substring(0, 6) + "••••••••" + rawKey.substring(len - 4);
+    } else {
+      apiKeyMasked = "••••••••";
+    }
+  }
+
+  res.json({
+    provider: "openrouter",
+    model: activeOpenRouterModel,
+    openrouterConfigured: openrouterApiKeyConfigured,
+    apiKeyMasked: apiKeyMasked
+  });
+});
+
+app.post("/api/ai-config", (req, res) => {
+  const { model, apiKey } = req.body;
+  const currentConfig = readAiConfig();
+
+  if (model) {
+    currentConfig.model = model;
+    activeOpenRouterModel = model;
+  }
+  if (apiKey !== undefined) {
+    currentConfig.apiKey = apiKey;
+  }
+  writeAiConfig(currentConfig);
+
+  const rawKey = currentConfig.apiKey || process.env.OPENROUTER_API_KEY || "";
+  const openrouterApiKeyConfigured = !!(rawKey && rawKey !== "MY_OPENROUTER_API_KEY" && rawKey !== "");
+
+  let apiKeyMasked = "";
+  if (openrouterApiKeyConfigured) {
+    const len = rawKey.length;
+    if (len > 8) {
+      apiKeyMasked = rawKey.substring(0, 6) + "••••••••" + rawKey.substring(len - 4);
+    } else {
+      apiKeyMasked = "••••••••";
+    }
+  }
+
+  res.json({
+    success: true,
+    provider: "openrouter",
+    model: activeOpenRouterModel,
+    openrouterConfigured: openrouterApiKeyConfigured,
+    apiKeyMasked: apiKeyMasked
+  });
+});
 
 // API Endpoints for Content CRM
 app.get("/api/ideas", (req, res) => {
@@ -266,7 +408,7 @@ app.delete("/api/ideas/:id", (req, res) => {
   res.json({ message: "Successfully deleted topic.", id: req.params.id });
 });
 
-// AI modules calling the official server-side @google/genai SDK
+// AI modules calling the official server-side OpenRouter unified API exclusively
 app.post("/api/generate", async (req, res) => {
   const { topic, keywords, tone } = req.body;
   if (!topic) {
@@ -276,10 +418,7 @@ app.post("/api/generate", async (req, res) => {
   const promptKeywords = keywords ? `Focus keywords: ${keywords}` : "Focus keywords: Automatically align with high-intent search terms for this topic.";
   const promptTone = tone || "Expert and engaging Professional Digital Marketer";
 
-  try {
-    const ai = getGeminiClient();
-    
-    const targetPrompt = `
+  const targetPrompt = `
 You are an expert SEO Content Strategist and Copywriter. Create a complete, high-quality Blogger-ready blog post payload for this topic:
 Topic: "${topic}"
 Tone: ${promptTone}
@@ -298,80 +437,151 @@ You MUST output your response in STRICTURE JSON format. Ensure all strings are e
 Format your full output exclusively as a valid JSON object matching the JSON response schema. Let the AI output be exactly this JSON and nothing else.
 `;
 
-    const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: targetPrompt,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            title: { type: Type.STRING },
-            metaDescription: { type: Type.STRING },
-            labels: { type: Type.STRING },
-            featuredImagePrompt: { type: Type.STRING },
-            sectionImagePrompts: {
-              type: Type.ARRAY,
-              items: { type: Type.STRING }
-            },
-            articleHtml: { type: Type.STRING },
-            faqHtml: { type: Type.STRING },
-            takeawaysHtml: { type: Type.STRING }
-          },
-          required: [
-            "title",
-            "metaDescription",
-            "labels",
-            "featuredImagePrompt",
-            "sectionImagePrompts",
-            "articleHtml",
-            "faqHtml",
-            "takeawaysHtml"
-          ]
-        },
-      }
-    });
+  const currentConfig = readAiConfig();
+  const modelToUse = currentConfig.model;
+  const apiKey = currentConfig.apiKey || process.env.OPENROUTER_API_KEY;
 
-    const outputText = response.text;
-    if (!outputText) {
-      throw new Error("Received empty content generation response from Gemini.");
-    }
-
-    try {
-      const parsedData = JSON.parse(outputText.trim());
-      res.json(parsedData);
-    } catch (parseError) {
-      console.error("JSON Parsing failed. Output was:", outputText);
-      res.status(500).json({
-        error: "Failed to parse generated system payload as strict JSON structure.",
-        rawOutput: outputText
+  try {
+    if (!apiKey || apiKey === "MY_OPENROUTER_API_KEY" || apiKey === "") {
+      return res.status(400).json({
+        error: "Your OpenRouter API Key is missing. Click the 'AI Settings' button in the header and configure your custom API Key and Model Name directly.",
+        needsApiKey: true
       });
     }
 
-  } catch (error: any) {
-    console.error("Gemini content generation failed:", error);
-    res.status(500).json({
-      error: error.message || "An internal error occurred during content generation.",
-      needsApiKey: !process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY === "MY_GEMINI_API_KEY"
+    const appUrl = process.env.APP_URL || "https://wiredbyapun-os.run.app";
+    console.log(`[OpenRouter] Triggering generation via ${modelToUse}...`);
+
+    let openRouterResponse = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+        "HTTP-Referer": appUrl,
+        "X-Title": "WiredByApun Content OS"
+      },
+      body: JSON.stringify({
+        model: modelToUse,
+        messages: [
+          {
+            role: "user",
+            content: targetPrompt
+          }
+        ],
+        response_format: { type: "json_object" }
+      })
     });
+
+    // Handle common OpenRouter situations where specific endpoint combinations or models do not support response_format: json_object
+    if (!openRouterResponse.ok) {
+      const errText = await openRouterResponse.clone().text();
+      const isFormatError = openRouterResponse.status === 400 || 
+                            errText.toLowerCase().includes("format") || 
+                            errText.toLowerCase().includes("parameter") ||
+                            errText.toLowerCase().includes("supported") ||
+                            errText.toLowerCase().includes("schema");
+      
+      if (isFormatError) {
+        console.warn(`[OpenRouter] Selected model ${modelToUse} returned formatting error; retrying without strict json_object constraint...`);
+        openRouterResponse = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${apiKey}`,
+            "Content-Type": "application/json",
+            "HTTP-Referer": appUrl,
+            "X-Title": "WiredByApun Content OS"
+          },
+          body: JSON.stringify({
+            model: modelToUse,
+            messages: [
+              {
+                role: "user",
+                content: targetPrompt
+              }
+            ]
+          })
+        });
+      }
+    }
+
+    if (!openRouterResponse.ok) {
+      const errText = await openRouterResponse.text();
+      throw new Error(`OpenRouter API call failed with status ${openRouterResponse.status}: ${errText}`);
+    }
+
+    const orData = await openRouterResponse.json();
+    const outputText = orData.choices?.[0]?.message?.content;
+    if (!outputText) {
+      throw new Error("Received empty content generation response from OpenRouter.");
+    }
+
+    // Resilient json cleanup and extraction
+    const cleanJson = extractJson(outputText);
+
+    try {
+      const parsedData = JSON.parse(cleanJson);
+      res.json(parsedData);
+    } catch (parseError) {
+      console.error("OpenRouter JSON parsing failed. Cleaned content was:", cleanJson);
+      res.status(500).json({
+        error: "Failed to parse OpenRouter response as dynamic structural CRM JSON structure. Ensure the selected model generates strict JSON format.",
+        rawOutput: outputText
+      });
+    }
+  } catch (error: any) {
+    return handleAIError(error, res);
   }
 });
 
 // Image prompt generation and editing helper
 app.post("/api/generate-image-prompts", async (req, res) => {
   const { topic } = req.body;
+  const currentConfig = readAiConfig();
+  const modelToUse = currentConfig.model;
+  const apiKey = currentConfig.apiKey || process.env.OPENROUTER_API_KEY;
+
   try {
-    const ai = getGeminiClient();
     const prompt = `Based on this blog topic: "${topic}", write a professional, highly detailed, visually descriptive prompt to generate a stunning featured image. The image should be rich, high-contrast, modern, editorial style, containing specific suggestions for camera angle, lighting, background elements, and rendering quality.`;
     
-    const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: prompt,
+    if (!apiKey || apiKey === "MY_OPENROUTER_API_KEY" || apiKey === "") {
+      return res.status(400).json({ 
+        error: "Your OpenRouter API Key is missing. Click the 'AI Settings' button in the header and configure your custom API Key and Model Name directly.",
+        needsApiKey: true
+      });
+    }
+
+    const appUrl = process.env.APP_URL || "https://wiredbyapun-os.run.app";
+    console.log(`[OpenRouter] Image prompt generation via ${modelToUse}...`);
+
+    const openRouterResponse = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+        "HTTP-Referer": appUrl,
+        "X-Title": "WiredByApun Content OS"
+      },
+      body: JSON.stringify({
+        model: modelToUse,
+        messages: [
+          {
+            role: "user",
+            content: prompt
+          }
+        ]
+      })
     });
 
-    res.json({ prompt: response.text });
+    if (!openRouterResponse.ok) {
+      const errorText = await openRouterResponse.text();
+      throw new Error(`OpenRouter API failed: ${openRouterResponse.status} - ${errorText}`);
+    }
+
+    const orData = await openRouterResponse.json();
+    const outputText = orData.choices?.[0]?.message?.content;
+    res.json({ prompt: outputText });
   } catch (error: any) {
-    res.status(500).json({ error: error.message });
+    return handleAIError(error, res);
   }
 });
 
